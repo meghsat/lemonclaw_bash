@@ -87,6 +87,10 @@ Pings `http://127.0.0.1:13305/api/v1/models` to check whether the server is alre
 
 Calls `lemonade list` to retrieve all known models and their download status. Displays an interactive arrow-key menu in the terminal showing each model's name, backend, and whether it has already been downloaded.
 
+<p align="center">
+  <img width="300" height="300" alt="image" src="https://github.com/user-attachments/assets/7bc4463c-a4c6-4bfd-9b4b-f024d5ae2ecb" />
+</p>
+
 - If only one model is available it is selected automatically.
 - If the chosen model has not been downloaded yet, you are offered the option to `lemonade pull` it before continuing (this can take a while for large GGUF files).
 - The model can be pre-selected non-interactively via `OPENCLAW_LEMONADE_MODEL_ID`.
@@ -159,6 +163,10 @@ openclaw gateway run --bind loopback --port 18789 --force
 ```
 
 The gateway is the local HTTP server that the OpenClaw web UI and browser extension talk to. Keeping it in the foreground means the terminal session stays attached; use a terminal multiplexer (`tmux`, `screen`) or a separate terminal if you want to keep using the shell while the gateway runs.
+
+<p align="center">
+  <img width="600" height="600" alt="Screenshot from 2026-04-03 23-53-15" src="https://github.com/user-attachments/assets/7f67ffbc-edc5-44d3-ad5a-443f7f1cb0f9" />
+</p>
 
 ---
 
