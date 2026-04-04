@@ -17,7 +17,7 @@ This script automates the full end-to-end setup: it installs and builds Lemonade
 ## Quick Start
 
 ```bash
-bash openclaw-lemonade-setup.sh
+curl -fsSL https://raw.githubusercontent.com/meghsat/lemonclaw_bash/main/openclaw-lemonade-setup.sh | bash
 ```
 
 The script is fully idempotent: Re-running it is safe and will skip any steps that are already complete.
