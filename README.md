@@ -10,7 +10,6 @@ This script automates the full end-to-end setup: it installs and builds Lemonade
 
 - Ubuntu 24.04 (x86-64)
 - Internet connection (for downloading packages and model weights)
-- GPU with 40+ GB of graphics memory (required to run the default Qwen3.5-35B model at usable speed)
 
 ---
 
