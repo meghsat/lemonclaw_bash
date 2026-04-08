@@ -41,6 +41,12 @@ All settings can be overridden via environment variables before running the scri
 
 ---
 
+**Note:** The script builds Lemonade from source to include an additional model, **Qwen3.5-35B-A3B-Q4-K-M-GGUF**, in the list. If you choose not to include this model, you don’t need to build Lemonade from source, simply running these steps will install the server.
+```bash
+sudo add-apt-repository ppa:lemonade-team/stable
+sudo apt install lemonade-server
+```
+
 ## What the Script Does
 
 ### Step 1 — System prerequisites
@@ -48,12 +54,6 @@ All settings can be overridden via environment variables before running the scri
 Updates `apt` and installs: `git`, `build-essential` (gcc/g++/make), `wget`, `jq`, `curl`, and `python3`.
 
 CMake 3.28+ is required to build Lemonade. If the system CMake is older than 3.28.0 (or absent), the script downloads and installs the official CMake 3.28.6 binary from the Kitware GitHub releases into `/usr/local`.
-
-**Note:** The following steps build Lemonade from source to include an additional model, **Qwen3.5-35B-A3B-Q4-K-M-GGUF**, in the list. If you choose not to include this model, you don’t need to build Lemonade from source, simply running these steps will install the server.
-```bash
-sudo add-apt-repository ppa:lemonade-team/stable
-sudo apt install lemonade-server
-```
 
 ### Step 2 — Clone Lemonade
 
