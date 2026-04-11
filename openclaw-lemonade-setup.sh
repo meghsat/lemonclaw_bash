@@ -4,8 +4,6 @@ set -Eeuo pipefail
 SCRIPT_NAME="OpenclawXLemonade"
 SCRIPT_VERSION="0.1.0"
 
-LEMONADE_DIR="${LEMONADE_DIR:-$HOME/lemonade-dev/lemonade}"
-LEMONADE_BUILD_DIR="${LEMONADE_DIR}/build"
 LEMONADE_BASE_URL="${LEMONADE_BASE_URL:-http://127.0.0.1:13305}"
 LEMONADE_PORT="${LEMONADE_PORT:-13305}"
 
@@ -19,7 +17,8 @@ OPENCLAW_LEMONADE_GATEWAY_PORT="${OPENCLAW_LEMONADE_GATEWAY_PORT:-18789}"
 OPENCLAW_LEMONADE_GATEWAY_BIND="${OPENCLAW_LEMONADE_GATEWAY_BIND:-loopback}"
 OPENCLAW_LEMONADE_SKIP_TUNING="${OPENCLAW_LEMONADE_SKIP_TUNING:-0}"
 
-RAN_ONBOARD=0
+RECOMMENDED_MODEL_ID="Qwen3.5-35B-A3B-Q4-K-M-GGUF"
+RECOMMENDED_MODEL_SIZE="~22 GB"
 
 print_banner() {
   printf '\033[1;33m    🦞  OpenClaw on AMD (Lemonade + Linux)  🦞\033[0m\n'
@@ -43,177 +42,56 @@ append_line_if_missing() {
   grep -qxF "$line" "$file" 2>/dev/null || printf '%s\n' "$line" >> "$file"
 }
 
-apt_install_if_missing() {
+# ---------------------------------------------------------------------------
+# Step 1 — Install Lemonade via PPA
+# ---------------------------------------------------------------------------
+install_lemonade_via_ppa() {
   have apt-get || die "This script requires apt-get (Ubuntu/Debian)."
+
+  info "Installing prerequisites..."
   local missing=()
-  local pkg
-  for pkg in "$@"; do
+  for pkg in software-properties-common curl python3 wget; do
     dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
   done
   if (( ${#missing[@]} > 0 )); then
-    info "Installing missing packages: ${missing[*]}"
     sudo apt-get update
     DEBIAN_FRONTEND=noninteractive sudo apt-get install -y "${missing[@]}"
-  else
-    info "All required packages already installed — skipping apt-get"
-  fi
-}
-
-# ---------------------------------------------------------------------------
-# Step 1 — System prerequisites
-# ---------------------------------------------------------------------------
-install_prerequisites() {
-  apt_install_if_missing git build-essential wget jq curl python3
-
-  info "Checking CMake version..."
-  local current_version="0.0.0"
-  if have cmake; then
-    current_version="$(cmake --version | head -n1 | awk '{print $3}')"
-    info "Found CMake ${current_version}"
   fi
 
-  local required_version="3.28.0"
-  if printf '%s\n%s\n' "$required_version" "$current_version" | sort -C -V; then
-    info "CMake ${current_version} satisfies >= ${required_version} — skipping"
-    return 0
-  fi
-
-  info "Installing CMake 3.28.6 from official binary..."
-  local cmake_version="3.28.6"
-  local tmp_dir
-  tmp_dir="$(mktemp -d)"
-  (
-    cd "$tmp_dir"
-    wget -q "https://github.com/Kitware/CMake/releases/download/v${cmake_version}/cmake-${cmake_version}-linux-x86_64.sh"
-    chmod +x "cmake-${cmake_version}-linux-x86_64.sh"
-    sudo "./cmake-${cmake_version}-linux-x86_64.sh" --skip-license --prefix=/usr/local
-  )
-  rm -rf "$tmp_dir"
-  info "Installed $(cmake --version | head -n1)"
-}
-
-# ---------------------------------------------------------------------------
-# Step 2 — Clone lemonade (idempotent)
-# ---------------------------------------------------------------------------
-clone_lemonade() {
-  if [[ -d "$LEMONADE_DIR/.git" ]]; then
-    info "Lemonade repo already present at ${LEMONADE_DIR} — skipping clone"
-    return 0
-  fi
-
-  local parent_dir
-  parent_dir="$(dirname "$LEMONADE_DIR")"
-  info "Cloning lemonade into ${LEMONADE_DIR}..."
-  mkdir -p "$parent_dir"
-  git clone https://github.com/lemonade-sdk/lemonade.git "$LEMONADE_DIR"
-}
-
-# ---------------------------------------------------------------------------
-# Step 3 — Patch server_models.json with Qwen model entry (idempotent)
-# ---------------------------------------------------------------------------
-patch_server_models() {
-  # Patch both the source and build copies so the model entry exists
-  local src_file="${LEMONADE_DIR}/src/cpp/resources/server_models.json"
-  local build_file="${LEMONADE_BUILD_DIR}/resources/server_models.json"
-
-  [[ -f "$src_file" ]] || die "server_models.json not found at ${src_file}"
-
-  _apply_patch() {
-    local models_file="$1"
-    [[ -f "$models_file" ]] || return 0
-    if jq -e '."Qwen3.5-35B-A3B-Q4-K-M-GGUF"' "$models_file" >/dev/null 2>&1; then
-      info "Qwen3.5-35B-A3B model entry already present in ${models_file} — skipping"
-      return 0
-    fi
-    info "Patching ${models_file}..."
-    local tmp_file
-    tmp_file="$(mktemp)"
-    jq '. + {
-      "Qwen3.5-35B-A3B-Q4-K-M-GGUF": {
-        "checkpoint": "unsloth/Qwen3.5-35B-A3B-GGUF:Qwen3.5-35B-A3B-Q4_K_M.gguf",
-        "mmproj": "mmproj-F16.gguf",
-        "recipe": "llamacpp",
-        "suggested": true,
-        "labels": ["vision", "tool-calling", "hot"],
-        "size": 19.7
-      }
-    }' "$models_file" > "$tmp_file" && mv "$tmp_file" "$models_file"
-  }
-
-  _apply_patch "$src_file"
-  _apply_patch "$build_file"
-
-  # Write ctx_size to lemonade's recipe_options cache — this is what lemond
-  # actually reads at load time (server_models.json recipe_options only applies
-  # during 'lemonade pull', not on load)
-  local recipe_opts_file="$HOME/.cache/lemonade/recipe_options.json"
-  info "Writing ctx_size=32768 to ${recipe_opts_file}..."
-  python3 - <<PY "$recipe_opts_file"
-import json, sys
-from pathlib import Path
-p = Path(sys.argv[1])
-p.parent.mkdir(parents=True, exist_ok=True)
-data = json.loads(p.read_text()) if p.exists() else {}
-data.setdefault('Qwen3.5-35B-A3B-Q4-K-M-GGUF', {})['ctx_size'] = 32768
-p.write_text(json.dumps(data, indent=2))
-PY
-  info "server_models.json patched"
-}
-
-# ---------------------------------------------------------------------------
-# Step 4 — Build lemonade (idempotent: skips if lemonade-server already built)
-# ---------------------------------------------------------------------------
-build_lemonade() {
-  if [[ -x "${LEMONADE_BUILD_DIR}/lemond" ]] || [[ -x "${LEMONADE_BUILD_DIR}/lemonade-server" ]]; then
-    info "Lemonade already built at ${LEMONADE_BUILD_DIR} — skipping build"
-    return 0
-  fi
-
-  info "Running lemonade setup.sh..."
-  (
-    cd "$LEMONADE_DIR"
-    CI=1 ./setup.sh
-    cmake --build --preset default
-  )
-  info "Lemonade build complete"
-}
-
-# ---------------------------------------------------------------------------
-# Step 5 — Add lemonade build dir to PATH (idempotent)
-# ---------------------------------------------------------------------------
-add_lemonade_to_path() {
-  local path_line="export PATH=\"${LEMONADE_BUILD_DIR}:\$PATH\""
-  append_line_if_missing "$HOME/.profile" "$path_line"
-  append_line_if_missing "$HOME/.bashrc" "$path_line"
-  [[ -f "$HOME/.zshrc" ]] && append_line_if_missing "$HOME/.zshrc" "$path_line"
-
-  export PATH="${LEMONADE_BUILD_DIR}:$PATH"
-  hash -r 2>/dev/null || true
-
-  have lemond || have lemonade-server \
-    || die "Neither 'lemond' nor 'lemonade-server' found after adding ${LEMONADE_BUILD_DIR} to PATH."
-  have lemonade \
-    || die "'lemonade' CLI not found after adding ${LEMONADE_BUILD_DIR} to PATH."
-  info "Lemonade binaries are on PATH"
-}
-
-# ---------------------------------------------------------------------------
-# Lemonade CLI helpers
-# 'lemond'   — server daemon (replaces 'lemonade-server serve')
-# 'lemonade' — CLI commands  (replaces 'lemonade-server list' etc.)
-# ---------------------------------------------------------------------------
-lemonade_cli() {
   if have lemonade; then
-    lemonade "$@"
-  elif have lemonade-server; then
-    lemonade-server "$@"
-  else
-    die "'lemonade' not found on PATH"
+    info "Lemonade already installed at $(command -v lemonade) — skipping PPA install"
+    return 0
   fi
+
+  info "Adding lemonade-team/bleeding-edge PPA..."
+  sudo add-apt-repository -y ppa:lemonade-team/bleeding-edge
+
+  info "Updating package lists..."
+  sudo apt-get update
+
+  info "Installing lemonade-server..."
+  DEBIAN_FRONTEND=noninteractive sudo apt-get install -y lemonade-server
+
+  have lemonade \
+    || die "'lemonade' not found on PATH after PPA install. Check that /usr/bin or /usr/local/bin is in your PATH."
+  info "Lemonade installed: $(command -v lemonade)"
 }
 
 # ---------------------------------------------------------------------------
-# Step 6 — Start lemonade server in background (idempotent)
+# Lemonade CLI helper — resolved once, cached in LEMONADE_CMD
+# ---------------------------------------------------------------------------
+LEMONADE_CMD=""
+
+_resolve_lemonade_cmd() {
+  if have lemonade; then          LEMONADE_CMD="lemonade"
+  elif have lemonade-server; then LEMONADE_CMD="lemonade-server"
+  else die "'lemonade' not found on PATH"; fi
+}
+
+lemonade_cli() { "$LEMONADE_CMD" "$@"; }
+
+# ---------------------------------------------------------------------------
+# Step 2 — Start lemonade server in background (idempotent)
 # ---------------------------------------------------------------------------
 start_lemonade_server() {
   if curl -fsS --max-time 2 "${LEMONADE_BASE_URL}/api/v1/models" >/dev/null 2>&1; then
@@ -231,7 +109,7 @@ start_lemonade_server() {
     die "Neither 'lemond' nor 'lemonade-server' found on PATH"
   fi
 
-  info "Starting lemonade server via '${server_cmd} serve' in background..."
+  info "Starting lemonade server via '${server_cmd}' in background..."
   nohup "$server_cmd" > /tmp/lemonade-server.log 2>&1 &
   disown
 
@@ -248,7 +126,54 @@ start_lemonade_server() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 7 — Model selection using 'lemonade list'
+# Step 2b — Ensure lemonade ctx_size is large enough for thinking models
+# ---------------------------------------------------------------------------
+LEMONADE_MIN_CTX_SIZE="${LEMONADE_MIN_CTX_SIZE:-32768}"
+
+configure_lemonade_ctx_size() {
+  local current_ctx
+  current_ctx="$(lemonade config 2>/dev/null | awk '/^[[:space:]]*ctx_size/{print $NF}')"
+
+  if [[ -n "$current_ctx" ]] && (( current_ctx >= LEMONADE_MIN_CTX_SIZE )); then
+    info "Lemonade ctx_size is ${current_ctx} (>= ${LEMONADE_MIN_CTX_SIZE}) — skipping"
+    return 0
+  fi
+
+  info "Setting lemonade ctx_size to ${LEMONADE_MIN_CTX_SIZE} (was ${current_ctx:-unknown})..."
+  lemonade config set "ctx_size=${LEMONADE_MIN_CTX_SIZE}" \
+    || die "Failed to configure lemonade ctx_size — is the server running?"
+
+  # Unload every downloaded model so they all reload with the new ctx_size.
+  local model_ids_json
+  model_ids_json="$(curl -s "${LEMONADE_BASE_URL}/api/v1/models" 2>/dev/null \
+    | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin).get('data', [])
+    ids = [m['id'] for m in data if isinstance(m, dict) and m.get('downloaded')]
+    print('\n'.join(ids))
+except Exception:
+    pass
+" 2>/dev/null || true)"
+
+  if [[ -n "$model_ids_json" ]]; then
+    while IFS= read -r model_id; do
+      [[ -z "$model_id" ]] && continue
+      info "Unloading '${model_id}' so it reloads with ctx_size=${LEMONADE_MIN_CTX_SIZE}..."
+      curl -s -X POST "${LEMONADE_BASE_URL}/api/v1/unload" \
+        -H "Content-Type: application/json" \
+        -d "{\"model\": \"${model_id}\"}" >/dev/null 2>&1 || true
+    done <<< "$model_ids_json"
+  fi
+
+  info "Context size configured: ${LEMONADE_MIN_CTX_SIZE} tokens"
+}
+
+# ---------------------------------------------------------------------------
+# Step 3 — Model selection
+#   Suggest the recommended Qwen model first
+#   If accepted: lemonade import + pull
+#   If declined: show lemonade list and let the user pick interactively
 # ---------------------------------------------------------------------------
 pick_from_menu() {
   local _result_var="$1"; shift
@@ -262,21 +187,26 @@ pick_from_menu() {
   printf '\033[?25l' > /dev/tty
 
   _draw_menu() {
-    local i
+    local i term_width max_label label
+    term_width=$(tput cols 2>/dev/null || printf '80')
+    max_label=$(( term_width - 7 ))
+    printf '\033[u' > /dev/tty
     for i in "${!_items[@]}"; do
       printf '\r\033[2K' > /dev/tty
+      label="${_items[$i]}"
+      (( ${#label} > max_label )) && label="${label:0:$(( max_label - 1 ))}…"
       if (( i == _cur )); then
-        printf '  \033[1;7;36m > %s \033[0m\n' "${_items[$i]}" > /dev/tty
+        printf '  \033[1;7;36m > %s \033[0m\n' "$label" > /dev/tty
       else
-        printf '  \033[0;90m   %s\033[0m\n' "${_items[$i]}" > /dev/tty
+        printf '  \033[0;90m   %s\033[0m\n' "$label" > /dev/tty
       fi
     done
     printf '\r\033[2K\033[0;33m  ↑↓ move  ⏎ select\033[0m' > /dev/tty
-    printf '\033[%dA' "$(( _count ))" > /dev/tty
   }
 
   printf '\n' > /dev/tty
   printf '\033[1;34m[INFO]\033[0m %s\n\n' "$_prompt" > /dev/tty
+  printf '\033[s' > /dev/tty
   _draw_menu
 
   local _key
@@ -299,44 +229,79 @@ pick_from_menu() {
     fi
   done
 
-  printf '\033[%dB' "$(( _count ))" > /dev/tty
   printf '\r\033[2K\n' > /dev/tty
   printf '\033[?25h' > /dev/tty
   stty "$_old_stty" < /dev/tty 2>/dev/null || true
-  eval "$_result_var=\${_items[\$_cur]}"
+  printf -v "$_result_var" '%s' "${_items[$_cur]}"
 }
 
-# Parse 'lemonade list' fixed-width output into parallel arrays:
-#   LEMONADE_MODEL_NAMES[] — rich display label shown in picker
-#   LEMONADE_MODEL_IDS[]   — raw model name passed to openclaw
 parse_lemonade_models() {
   LEMONADE_MODEL_NAMES=()
   LEMONADE_MODEL_IDS=()
   LEMONADE_MODEL_DOWNLOADED=()
 
-  local line name downloaded backend label
-  while IFS= read -r line; do
-    [[ "$line" =~ ^Model\ Name ]] && continue
-    [[ "$line" =~ ^-+$         ]] && continue
-    [[ "$line" =~ ^WARNING     ]] && continue
-    [[ -z "${line// /}"        ]] && continue
-
-    # Columns are fixed-width; split on runs of 2+ spaces
-    name="$(      printf '%s' "$line" | awk -F'  +' '{print $1}')"
-    downloaded="$(printf '%s' "$line" | awk -F'  +' '{print $2}')"
-    backend="$(   printf '%s' "$line" | awk -F'  +' '{print $NF}')"
-
+  local name downloaded backend label display_name
+  while IFS=$'\t' read -r name downloaded backend; do
     [[ -z "$name" ]] && continue
-
-    label="${name}  [${backend}]"
+    display_name="${name#user.}"
+    label="${display_name}  [${backend}]"
     [[ "$downloaded" == "Yes" ]] && label+=" ✓" || label+=" (not downloaded)"
     LEMONADE_MODEL_NAMES+=("$label")
     LEMONADE_MODEL_IDS+=("$name")
     LEMONADE_MODEL_DOWNLOADED+=("$downloaded")
-  done < <(lemonade_cli list 2>/dev/null)
+  done < <(
+    if [[ -n "${1:-}" ]]; then printf '%s\n' "$1"
+    else lemonade_cli list 2>/dev/null; fi \
+    | awk -F'  +' '
+      /^Model Name/ || /^-+$/ || /^WARNING/ || /^[[:space:]]*$/ { next }
+      $1 != "" { printf "%s\t%s\t%s\n", $1, $2, $NF }
+    '
+  )
 
   (( ${#LEMONADE_MODEL_IDS[@]} > 0 )) \
-    || die "No models found via 'lemonade list'. Check server_models.json."
+    || die "No models found via 'lemonade list'. Is the lemonade server running?"
+}
+
+import_recommended_model() {
+  info "Importing recommended model into lemonade..."
+  local tmp_json
+  tmp_json="$(mktemp --suffix=.json)"
+  cat > "$tmp_json" <<'JSON'
+{
+  "model_name": "Qwen3.5-35B-A3B-Q4-K-M-GGUF",
+  "checkpoint": "unsloth/Qwen3.5-35B-A3B-GGUF:Qwen3.5-35B-A3B-Q4_K_M.gguf",
+  "mmproj": "unsloth/Qwen3.5-35B-A3B-GGUF:mmproj-F16.gguf",
+  "recipe": "llamacpp",
+  "suggested": true,
+  "labels": ["vision", "tool-calling", "hot"],
+  "size": 19.7,
+  "recipe_options": {"ctx_size": 32768}
+}
+JSON
+  lemonade_cli import "$tmp_json" \
+    || die "lemonade import failed. Check the server logs."
+  rm -f "$tmp_json"
+  info "Model imported: ${RECOMMENDED_MODEL_ID}"
+}
+
+pull_model_if_needed() {
+  local model_id="$1"
+  local downloaded="${2:-}"
+
+  if [[ -z "$downloaded" ]]; then
+    downloaded="$(lemonade_cli list 2>/dev/null \
+      | awk -F'  +' -v m="$model_id" '$1==m {print $2}')"
+  fi
+
+  if [[ "$downloaded" == "Yes" ]]; then
+    info "Model '${model_id}' is already downloaded."
+    return 0
+  fi
+
+  info "Pulling '${model_id}' (this may take a while)..."
+  lemonade_cli pull "$model_id" \
+    || die "lemonade pull failed for ${model_id}"
+  info "Download complete"
 }
 
 select_lemonade_model() {
@@ -345,67 +310,114 @@ select_lemonade_model() {
     return 0
   fi
 
-  info "Querying available models via 'lemonade list'..."
-  parse_lemonade_models
+  printf '\n'
+  printf '\033[1;34m[INFO]\033[0m Recommended model for best experience:\n'
+  printf '       \033[1;36munsloth/Qwen3.5-35B-A3B-GGUF:Qwen3.5-35B-A3B-Q4_K_M.gguf\033[0m\n'
+  printf '       Size: \033[1;33m%s\033[0m\n' "$RECOMMENDED_MODEL_SIZE"
+  printf '\n'
 
-  if (( ${#LEMONADE_MODEL_IDS[@]} == 1 )); then
-    OPENCLAW_LEMONADE_MODEL_ID="${LEMONADE_MODEL_IDS[0]}"
-    info "Only one model available: ${OPENCLAW_LEMONADE_MODEL_ID}"
+  local model_choice
+  pick_from_menu model_choice \
+    "Use the recommended Qwen3.5-35B-A3B-Q4_K_M model? (${RECOMMENDED_MODEL_SIZE} download)" \
+    "Yes — import and use Qwen3.5-35B-A3B-Q4_K_M.gguf (recommended)" \
+    "No — show available models and let me choose"
+
+  if [[ "$model_choice" == Yes* ]]; then
+    import_recommended_model
+    OPENCLAW_LEMONADE_MODEL_ID="user.${RECOMMENDED_MODEL_ID}"
+    pull_model_if_needed "$OPENCLAW_LEMONADE_MODEL_ID"
   else
-    local selected_label
-    pick_from_menu selected_label \
-      "Select a model (✓ = already downloaded):" \
-      "${LEMONADE_MODEL_NAMES[@]}"
+    while true; do
+      info "Available models:"
+      printf '\n'
+      local list_output
+      list_output="$(lemonade_cli list 2>/dev/null)"
+      printf '%s\n\n' "$list_output"
 
-    local i
-    for i in "${!LEMONADE_MODEL_NAMES[@]}"; do
-      if [[ "${LEMONADE_MODEL_NAMES[$i]}" == "$selected_label" ]]; then
-        OPENCLAW_LEMONADE_MODEL_ID="${LEMONADE_MODEL_IDS[$i]}"
-        break
+      parse_lemonade_models "$list_output"
+
+      local selected_idx=0
+      if (( ${#LEMONADE_MODEL_IDS[@]} == 1 )); then
+        OPENCLAW_LEMONADE_MODEL_ID="${LEMONADE_MODEL_IDS[0]}"
+        info "Only one model available: ${OPENCLAW_LEMONADE_MODEL_ID}"
+      else
+        local selected_label
+        pick_from_menu selected_label \
+          "Select a model (✓ = already downloaded):" \
+          "${LEMONADE_MODEL_NAMES[@]}"
+
+        local i
+        for i in "${!LEMONADE_MODEL_NAMES[@]}"; do
+          if [[ "${LEMONADE_MODEL_NAMES[$i]}" == "$selected_label" ]]; then
+            OPENCLAW_LEMONADE_MODEL_ID="${LEMONADE_MODEL_IDS[$i]}"
+            selected_idx="$i"
+            break
+          fi
+        done
       fi
+
+      [[ -n "$OPENCLAW_LEMONADE_MODEL_ID" ]] || die "Could not resolve selected model id"
+      info "Selected model: ${OPENCLAW_LEMONADE_MODEL_ID}"
+
+      # Check if selected model is downloaded; offer to pull if not
+      if [[ "${LEMONADE_MODEL_DOWNLOADED[$selected_idx]}" != "Yes" ]]; then
+        local pull_choice
+        pick_from_menu pull_choice \
+          "'${OPENCLAW_LEMONADE_MODEL_ID}' is not downloaded yet. Download it now?" \
+          "Yes — download now" \
+          "No — go back and pick a different model"
+
+        if [[ "$pull_choice" == No* ]]; then
+          OPENCLAW_LEMONADE_MODEL_ID=""
+          continue
+        fi
+      fi
+
+      pull_model_if_needed "$OPENCLAW_LEMONADE_MODEL_ID" "${LEMONADE_MODEL_DOWNLOADED[$selected_idx]}"
+      break
     done
   fi
 
-  [[ -n "$OPENCLAW_LEMONADE_MODEL_ID" ]] || die "Could not resolve selected model id"
-  info "Selected model: ${OPENCLAW_LEMONADE_MODEL_ID}"
+  # If switching to a different model than what was previously configured,
+  # unload the old model so it doesn't hold VRAM when the new one loads.
+  if [[ -f "$OPENCLAW_CONFIG_FILE" ]]; then
+    local prev_model
+    prev_model="$(python3 -c "
+import json, sys
+from pathlib import Path
+try:
+    cfg = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+    ref = cfg.get('agents', {}).get('defaults', {}).get('model', {})
+    primary = ref.get('primary', '') if isinstance(ref, dict) else str(ref)
+    print(primary.split('/')[-1] if '/' in primary else primary)
+except Exception:
+    pass
+" "$OPENCLAW_CONFIG_FILE" 2>/dev/null || true)"
 
-  # Check if the selected model is downloaded; offer to pull it if not
-  local selected_idx
-  for selected_idx in "${!LEMONADE_MODEL_IDS[@]}"; do
-    [[ "${LEMONADE_MODEL_IDS[$selected_idx]}" == "$OPENCLAW_LEMONADE_MODEL_ID" ]] && break
-  done
-
-  if [[ "${LEMONADE_MODEL_DOWNLOADED[$selected_idx]}" != "Yes" ]]; then
-    local pull_choice
-    pick_from_menu pull_choice \
-      "'${OPENCLAW_LEMONADE_MODEL_ID}' is not downloaded yet. Download it now?" \
-      "Yes — download now" \
-      "No — go back and pick a different model"
-
-    if [[ "$pull_choice" == No* ]]; then
-      OPENCLAW_LEMONADE_MODEL_ID=""
-      select_lemonade_model   # recurse back to picker
-      return
+    if [[ -n "$prev_model" ]] && [[ "$prev_model" != "$OPENCLAW_LEMONADE_MODEL_ID" ]]; then
+      info "Model switch detected: '${prev_model}' -> '${OPENCLAW_LEMONADE_MODEL_ID}'"
+      info "Unloading previous model to free VRAM and clear KV cache..."
+      curl -s -X POST "${LEMONADE_BASE_URL}/api/v1/unload" \
+        -H "Content-Type: application/json" \
+        -d "{\"model\": \"${prev_model}\"}" >/dev/null 2>&1 || true
     fi
-
-    info "Pulling ${OPENCLAW_LEMONADE_MODEL_ID} (this may take a while)..."
-    lemonade_cli pull "$OPENCLAW_LEMONADE_MODEL_ID" \
-      || die "lemonade pull failed for ${OPENCLAW_LEMONADE_MODEL_ID}"
-    info "Download complete"
   fi
+
+  info "Using model: ${OPENCLAW_LEMONADE_MODEL_ID}"
 }
 
 # ---------------------------------------------------------------------------
-# Step 7b — Install OpenClaw if not already present
+# Step 4 — Install OpenClaw if not already present
 # ---------------------------------------------------------------------------
+_NPM_PREFIX=""
+
 refresh_openclaw_path() {
   export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PATH"
-  if have npm; then
-    local npm_prefix
-    npm_prefix="$(npm prefix -g 2>/dev/null || true)"
-    if [[ -n "$npm_prefix" ]]; then
-      export PATH="$npm_prefix/bin:$npm_prefix:$PATH"
-    fi
+  if have npm && [[ -z "$_NPM_PREFIX" ]]; then
+    _NPM_PREFIX="$(npm prefix -g 2>/dev/null || true)"
+  fi
+  if [[ -n "$_NPM_PREFIX" ]]; then
+    export PATH="$_NPM_PREFIX/bin:$_NPM_PREFIX:$PATH"
   fi
   hash -r 2>/dev/null || true
 }
@@ -439,15 +451,12 @@ persist_openclaw_path() {
 }
 
 install_openclaw() {
-  # Set npm prefix before installing so the binary lands somewhere predictable
   mkdir -p "$HOME/.npm-global"
   export NPM_CONFIG_PREFIX="$HOME/.npm-global"
-  have npm && npm config set prefix "$HOME/.npm-global" >/dev/null 2>&1 || true
 
   refresh_openclaw_path
   if have openclaw; then
     info "OpenClaw already installed — skipping"
-    refresh_openclaw_path
     return 0
   fi
 
@@ -462,7 +471,7 @@ install_openclaw() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 8 — OpenClaw onboard (non-interactive)
+# Step 5 — OpenClaw onboard (non-interactive)
 # ---------------------------------------------------------------------------
 backup_openclaw_config() {
   [[ -f "$OPENCLAW_CONFIG_FILE" ]] || return 0
@@ -508,7 +517,6 @@ run_noninteractive_onboard() {
     --gateway-bind "$OPENCLAW_LEMONADE_GATEWAY_BIND" \
     --skip-health \
     --accept-risk
-  RAN_ONBOARD=1
 }
 
 configure_openclaw() {
@@ -517,16 +525,21 @@ configure_openclaw() {
 
   if is_openclaw_configured; then
     info "OpenClaw already configured for lemonade/${OPENCLAW_LEMONADE_MODEL_ID} — skipping onboard"
-    RAN_ONBOARD=1
     return 0
   fi
 
   backup_openclaw_config
   run_noninteractive_onboard || die "OpenClaw onboarding against lemonade server failed."
+
+  if systemctl --user is-failed openclaw-gateway.service >/dev/null 2>&1; then
+    info "Resetting failed gateway service (race condition during onboard)..."
+    systemctl --user reset-failed openclaw-gateway.service 2>/dev/null || true
+  fi
+  systemctl --user start openclaw-gateway.service 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
-# Step 9 — Post-onboard tuning
+# Step 6 — Post-onboard tuning
 # ---------------------------------------------------------------------------
 auto_tune_config() {
   [[ "$OPENCLAW_LEMONADE_SKIP_TUNING" == "1" ]] && return 0
@@ -582,9 +595,8 @@ if entry is None:
 
 entry['contextWindow'] = context_tokens
 entry['maxTokens']     = model_max_tokens
+entry['reasoning']     = True
 entry['cost'] = {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0}
-entry['reasoning'] = True
-entry['compat'] = {'thinkingFormat': 'qwen'}
 
 # --- Embeddings via lemonade's nomic-embed (OpenAI-compatible /api/v1/embeddings) ---
 ms = defaults.setdefault('memorySearch', {})
@@ -610,10 +622,22 @@ PY
 }
 
 # ---------------------------------------------------------------------------
-# Step 9b — Install Google Chrome (needed for OpenClaw browser control)
+# Step 6b — Install Google Chrome (needed for OpenClaw browser control)
 # ---------------------------------------------------------------------------
+_CHROME_BIN=""
+
+find_chrome_bin() {
+  if [[ -n "$_CHROME_BIN" ]]; then printf '%s' "$_CHROME_BIN"; return; fi
+  if   have google-chrome-stable; then _CHROME_BIN="google-chrome-stable"
+  elif have google-chrome;        then _CHROME_BIN="google-chrome"
+  elif have chromium-browser;     then _CHROME_BIN="chromium-browser"
+  elif have chromium;             then _CHROME_BIN="chromium"
+  fi
+  printf '%s' "$_CHROME_BIN"
+}
+
 install_chrome_if_missing() {
-  if have google-chrome-stable || have google-chrome || have chromium-browser || have chromium; then
+  if [[ -n "$(find_chrome_bin)" ]]; then
     info "Chrome/Chromium already installed — skipping"
     return 0
   fi
@@ -635,70 +659,60 @@ install_chrome_if_missing() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 9c — Write TOOLS.md so the agent knows how to use Chrome
+# Step 6c — Write TOOLS.md so the agent knows how to use Chrome
 # ---------------------------------------------------------------------------
+_tools_md_body() {
+  cat <<'BODY'
+
+## Chrome Browser Usage and Control
+- Chrome is available with CDP on port 9222
+- If the user asks you to open a browser or visit a URL, use Chrome via the commands below
+- Use the `default` browser profile: `openclaw browser --browser-profile default`
+- To navigate: `openclaw browser --browser-profile default navigate <url>`
+- To launch Chrome manually: `google-chrome-stable --remote-debugging-port=9222 --user-data-dir=$HOME/.openclaw/browser/chrome-profile`
+
+## Environment
+- Platform: Linux (native)
+- LLM Backend: Lemonade (local, OpenAI-compatible API)
+BODY
+}
+
 write_tools_md() {
   local ws_dir="$HOME/.openclaw/workspace"
   local tools_file="$ws_dir/TOOLS.md"
 
   if [[ -f "$tools_file" ]] && ! grep -q '## Chrome Browser Usage and Control' "$tools_file" 2>/dev/null; then
     info "Appending browser environment info to TOOLS.md"
-    cat >> "$tools_file" <<'TOOLS_APPEND'
-
-## Chrome Browser Usage and Control
-- Chrome is available with CDP on port 9222
-- If the user asks you to open a browser or visit a URL, use Chrome via the commands below
-- Use the `default` browser profile: `openclaw browser --browser-profile default`
-- To navigate: `openclaw browser --browser-profile default navigate <url>`
-- To launch Chrome manually: `google-chrome-stable --remote-debugging-port=9222 --user-data-dir=$HOME/.openclaw/browser/chrome-profile`
-
-## Environment
-- Platform: Linux (native)
-- LLM Backend: Lemonade (local, OpenAI-compatible API)
-TOOLS_APPEND
+    _tools_md_body >> "$tools_file"
   elif [[ ! -f "$tools_file" ]]; then
     mkdir -p "$ws_dir"
     info "Creating TOOLS.md with browser environment info"
-    cat > "$tools_file" <<'TOOLS_NEW'
-# Tools
-
-## Chrome Browser Usage and Control
-- Chrome is available with CDP on port 9222
-- If the user asks you to open a browser or visit a URL, use Chrome via the commands below
-- Use the `default` browser profile: `openclaw browser --browser-profile default`
-- To navigate: `openclaw browser --browser-profile default navigate <url>`
-- To launch Chrome manually: `google-chrome-stable --remote-debugging-port=9222 --user-data-dir=$HOME/.openclaw/browser/chrome-profile`
-
-## Environment
-- Platform: Linux (native)
-- LLM Backend: Lemonade (local, OpenAI-compatible API)
-TOOLS_NEW
+    { printf '# Tools\n'; _tools_md_body; } > "$tools_file"
   fi
 }
 
 # ---------------------------------------------------------------------------
-# Step 9d — Launch Chrome with CDP and open the OpenClaw dashboard
+# Step 6d — Launch Chrome with CDP and open the OpenClaw dashboard
 # ---------------------------------------------------------------------------
 launch_chrome_dashboard() {
-  local chrome_bin=""
-  if have google-chrome-stable;  then chrome_bin="google-chrome-stable"
-  elif have google-chrome;        then chrome_bin="google-chrome"
-  elif have chromium-browser;     then chrome_bin="chromium-browser"
-  elif have chromium;             then chrome_bin="chromium"
-  fi
+  local chrome_bin
+  chrome_bin="$(find_chrome_bin)"
 
   if [[ -z "$chrome_bin" ]]; then
     warn "Chrome not found — open the dashboard manually."
     return 0
   fi
 
-  # Get the dashboard URL (includes access token)
+  if curl -fsS --max-time 2 "http://127.0.0.1:9222/json/version" >/dev/null 2>&1; then
+    info "Chrome CDP already reachable on port 9222 — skipping launch"
+    return 0
+  fi
+
   local dashboard_url=""
   local dashboard_output
   dashboard_output="$(openclaw dashboard --no-open 2>&1 || true)"
   dashboard_url="$(printf '%s' "$dashboard_output" | grep -oP 'https?://\S+' | head -1 || true)"
 
-  # Fallback: extract token from config
   if [[ -z "$dashboard_url" ]] && [[ -f "$OPENCLAW_CONFIG_FILE" ]]; then
     local gw_token
     gw_token="$(python3 -c "
@@ -737,7 +751,7 @@ except Exception:
 }
 
 # ---------------------------------------------------------------------------
-# Step 10 — Interactive onboard (gateway/hooks/skills) + hatch
+# Step 7 — Interactive onboard (gateway/hooks/skills) + hatch
 # ---------------------------------------------------------------------------
 interactive_onboard_and_hatch() {
   refresh_openclaw_path
@@ -772,20 +786,31 @@ interactive_onboard_and_hatch() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 11 — Start OpenClaw gateway (foreground)
+# Step 8 — Start OpenClaw gateway (foreground)
 # ---------------------------------------------------------------------------
 start_openclaw_gateway() {
+  if systemctl --user is-failed openclaw-gateway.service >/dev/null 2>&1; then
+    info "Resetting failed gateway service state..."
+    systemctl --user reset-failed openclaw-gateway.service 2>/dev/null || true
+  fi
+
+  trap '
+    systemctl --user is-failed openclaw-gateway.service >/dev/null 2>&1 \
+      && systemctl --user reset-failed openclaw-gateway.service 2>/dev/null
+    systemctl --user is-active openclaw-gateway.service >/dev/null 2>&1 \
+      || systemctl --user start openclaw-gateway.service 2>/dev/null
+  ' EXIT INT TERM HUP
+
   info "Starting OpenClaw gateway (port ${OPENCLAW_LEMONADE_GATEWAY_PORT})..."
   openclaw gateway run \
     --bind "$OPENCLAW_LEMONADE_GATEWAY_BIND" \
     --port "$OPENCLAW_LEMONADE_GATEWAY_PORT" \
-    --force
+    --force || true
 }
 
 print_summary() {
   printf '\n'
   info "${SCRIPT_NAME} ${SCRIPT_VERSION} complete"
-  printf '  Lemonade dir      : %s\n' "$LEMONADE_DIR"
   printf '  Lemonade endpoint : %s/api/v1\n' "$LEMONADE_BASE_URL"
   printf '  Model             : %s\n' "$OPENCLAW_LEMONADE_MODEL_ID"
   printf '  Context tokens    : %s\n' "$OPENCLAW_LEMONADE_CONTEXT_TOKENS"
@@ -822,20 +847,19 @@ main() {
   fi
   printf '\n'
 
-  sudo -v                 
-  install_prerequisites   # Step 1: cmake, git, build-essential, jq, curl, python3
-  clone_lemonade          # Step 2: git clone lemonade
-  patch_server_models     # Step 3: inject Qwen model entry into server_models.json
-  build_lemonade          # Step 4: setup.sh + cmake --build
-  add_lemonade_to_path    # Step 5: export PATH with build dir, verify binaries
-  start_lemonade_server   # Step 6: lemond (background)
-  select_lemonade_model   # Step 7: lemonade list → interactive picker
-  install_openclaw              # Step 7b: curl install openclaw if missing
-  configure_openclaw            # Step 8: openclaw onboard --non-interactive
-  auto_tune_config              # Step 9: patch openclaw.json with model tuning
-  install_chrome_if_missing     # Step 9b: google-chrome for browser control
-  interactive_onboard_and_hatch # Step 10: gateway/hooks/skills + hatch + chrome dashboard
-  start_openclaw_gateway        # Step 11: openclaw gateway run (foreground)
+  sudo -v
+  install_lemonade_via_ppa    # Step 1: add PPA, apt install lemonade-server
+  _resolve_lemonade_cmd       # resolve lemonade/lemonade-server once
+  start_lemonade_server       # Step 2: lemond (background)
+  configure_lemonade_ctx_size # Step 2b: bump ctx_size so thinking models have room
+  select_lemonade_model       # Step 3: suggest Qwen or show lemonade list + picker
+  install_openclaw            # Step 4: curl install openclaw if missing
+  configure_openclaw          # Step 5: openclaw onboard --non-interactive
+  auto_tune_config            # Step 6: patch openclaw.json with model tuning
+  install_chrome_if_missing   # Step 6b: google-chrome for browser control
+  interactive_onboard_and_hatch # Step 7: gateway/hooks/skills + hatch + chrome dashboard
+  start_openclaw_gateway      # Step 8: openclaw gateway run (foreground)
 }
 
 main "$@"
+
