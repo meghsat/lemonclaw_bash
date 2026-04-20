@@ -138,7 +138,7 @@ openclaw gateway run --bind loopback --port 18789 --force
 The gateway is the local HTTP server that the OpenClaw web UI and browser extension talk to.
 
 <p align="center">
-  <img width="600" height="600" alt="Screenshot from 2026-04-03 23-53-15" src="https://github.com/user-attachments/assets/7f67ffbc-edc5-44d3-ad5a-443f7f1cb0f9" />
+  <img width="650" height="350" alt="Screenshot from 2026-04-03 23-53-15" src="https://github.com/user-attachments/assets/7f67ffbc-edc5-44d3-ad5a-443f7f1cb0f9" />
 </p>
 
 ---
